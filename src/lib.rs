@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub use builder::SyncoorBuilder;
-pub mod builder;
+mod builder;
 
 /// Sync mode to distinguish between historical catchup and live tracking
 #[derive(Debug, Clone, Copy, PartialEq)]
