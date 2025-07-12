@@ -1339,8 +1339,10 @@ dependencies = [
 [[package]]
 name = "evm-abi"
 version = "0.1.0"
+source = "git+https://github.com/Zacholme7/evm-abi#9e0a8c3e0624cc3b22f145f0d0731c6b6bfeef14"
 dependencies = [
  "alloy-contract",
+ "alloy-primitives",
  "alloy-sol-types",
 ]
 

@@ -15,4 +15,4 @@ alloy-sol-types = "1.2.1"
 tokio = { version = "1.45.1", features = ["full"] }
 anyhow = "1.0.98"
 futures-util = "0.3.31"
-evm-abi = { path = "../evm-abi" }
+evm-abi = { git = "https://github.com/Zacholme7/evm-abi" }
