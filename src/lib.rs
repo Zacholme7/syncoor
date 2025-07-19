@@ -1,5 +1,5 @@
 use alloy_primitives::Log;
-use alloy_provider::Provider;
+use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types::Filter;
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
@@ -47,25 +47,22 @@ struct SyncState {
 }
 
 /// Sync Coordinator
-pub struct Syncoor<P> {
+pub struct Syncoor {
     /// Sends newly synced event logs
     sender: UnboundedSender<SyncMessage>,
     /// The event filter to filter events
     filter: Filter,
     /// Http provider for Historical syncing
-    http_provider: Arc<P>,
+    http_provider: Arc<DynProvider>,
     /// Websocket provider for live syncing
-    ws_provider: Arc<P>,
+    ws_provider: Arc<DynProvider>,
     /// The range of blocks to sync per batch
     batch_size: u64,
     /// Starting block for historical sync (None means start from genesis)
     from_block: u64,
 }
 
-impl<P> Syncoor<P>
-where
-    P: Provider + Send + Sync + 'static,
-{
+impl Syncoor {
     /// Start the sync process
     pub async fn start(&mut self) -> Result<()> {
         println!("Getting latest block number...");

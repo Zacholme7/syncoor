@@ -39,7 +39,7 @@ impl SyncoorBuilder {
     }
 
     /// Build the Syncoor with properly configured providers
-    pub async fn build(self) -> Result<(Syncoor<impl Provider>, UnboundedReceiver<SyncMessage>)> {
+    pub async fn build(self) -> Result<(Syncoor, UnboundedReceiver<SyncMessage>)> {
         let (sender, receiver) = unbounded_channel::<SyncMessage>();
 
         // Create HTTP provider with connection pooling
