@@ -68,12 +68,15 @@ where
 {
     /// Start the sync process
     pub async fn start(&mut self) -> Result<()> {
+        println!("Getting latest block number...");
         // Get the latest block number
         let latest_block = self
             .http_provider
             .get_block_number()
             .await
             .map_err(|e| anyhow!("Failed to get latest block: {}", e))?;
+
+        println!("Latest block: {}", latest_block);
 
         let mut state = SyncState {
             current_block: self.from_block,
