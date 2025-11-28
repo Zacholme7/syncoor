@@ -1,8 +1,12 @@
-use crate::{SyncMessage, Syncoor};
+use crate::{
+    SyncMessage, Syncoor,
+    error::{Result, SyncoorError},
+};
 use alloy_provider::{Provider, ProviderBuilder, WsConnect};
 use alloy_rpc_types::Filter;
-use anyhow::Result;
+use reqwest::{ClientBuilder, Url};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// Builder for Syncoor
@@ -43,21 +47,26 @@ impl SyncoorBuilder {
         let (sender, receiver) = unbounded_channel::<SyncMessage>();
 
         // Create HTTP provider with connection pooling
-        let http_client = reqwest::ClientBuilder::new()
+        let http_client = ClientBuilder::new()
             .pool_max_idle_per_host(10)
-            .pool_idle_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+            .pool_idle_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| SyncoorError::HttpClientBuild(e.to_string()))?;
+
+        let http_url =
+            Url::parse(&self.http_url).map_err(|e| SyncoorError::HttpUrlParse(e.to_string()))?;
 
         let http_provider = ProviderBuilder::default()
-            .connect_reqwest(http_client, self.http_url.parse()?)
+            .connect_reqwest(http_client, http_url)
             .erased();
 
         // Create WebSocket provider
         let ws_connect = WsConnect::new(self.ws_url);
         let ws_provider = ProviderBuilder::new()
             .connect_ws(ws_connect)
-            .await?
+            .await
+            .map_err(|e| SyncoorError::WsProviderConnect(e.to_string()))?
             .erased();
 
         let syncoor = Syncoor {

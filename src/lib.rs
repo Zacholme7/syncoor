@@ -1,11 +1,14 @@
+pub mod error;
+
+use crate::error::{Result, SyncoorError};
 use alloy_primitives::Log;
 use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types::Filter;
-use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use std::cmp::min;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::error;
 
 pub use builder::SyncoorBuilder;
 mod builder;
@@ -18,7 +21,7 @@ pub enum SyncMode {
 }
 
 /// Sync Message that carries logs and context information
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum SyncMessage {
     /// Logs with sync mode context
     Logs {
@@ -35,7 +38,7 @@ pub enum SyncMessage {
         is_live: bool,
     },
     /// Error occurred during sync
-    Error(String),
+    Error(SyncoorError),
 }
 
 /// Sync state to track current progress
@@ -64,13 +67,13 @@ pub struct Syncoor {
 
 impl Syncoor {
     /// Start the sync process
-    pub async fn start(&mut self) -> Result<()> {
-        // Get the latest block number
+    pub async fn start(self) -> Result<()> {
+        // Get the latest block number up front so we can fail early if needed
         let latest_block = self
             .http_provider
             .get_block_number()
             .await
-            .map_err(|e| anyhow!("Failed to get latest block: {}", e))?;
+            .map_err(|e| SyncoorError::LatestBlockFetch(e.to_string()))?;
 
         let mut state = SyncState {
             current_block: self.from_block,
@@ -78,24 +81,34 @@ impl Syncoor {
             is_live: false,
         };
 
-        // Run historical sync first - this will loop until we catch up to the tip
-        if state.current_block < state.target_block {
-            self.historical_sync(&mut state).await?;
+        tokio::spawn(async move {
+            let result: Result<()> = async {
+                // Run historical sync first - this will loop until we catch up to the tip
+                if state.current_block < state.target_block {
+                    self.historical_sync(&mut state).await?;
 
-            // Signal transition to live mode
-            if let Err(e) = self.sender.send(SyncMessage::ModeTransition {
-                from: SyncMode::Historical,
-                to: SyncMode::Live,
-            }) {
-                return Err(anyhow!("Failed to send mode transition: {}", e));
+                    // Signal transition to live mode; log instead of failing if the channel is gone
+                    if let Err(e) = self.sender.send(SyncMessage::ModeTransition {
+                        from: SyncMode::Historical,
+                        to: SyncMode::Live,
+                    }) {
+                        error!("Failed to send mode transition: {}", e);
+                    }
+                }
+
+                // Mark as live and continue
+                state.is_live = true;
+
+                // Start live sync with streaming
+                self.live_sync(state).await
             }
-        }
+            .await;
 
-        // Mark as live and continue
-        state.is_live = true;
-
-        // Start live sync with streaming
-        self.live_sync(state).await?;
+            if let Err(e) = result {
+                error!("Sync task exited with error: {}", e);
+                let _ = self.sender.send(SyncMessage::Error(e));
+            }
+        });
 
         Ok(())
     }
@@ -104,10 +117,11 @@ impl Syncoor {
     async fn historical_sync(&self, state: &mut SyncState) -> Result<()> {
         loop {
             // Check the current tip of the chain
-            let current_tip =
-                self.http_provider.get_block_number().await.map_err(|e| {
-                    anyhow!("Failed to get latest block during historical sync: {}", e)
-                })?;
+            let current_tip = self
+                .http_provider
+                .get_block_number()
+                .await
+                .map_err(|e| SyncoorError::HistoricalLatestBlock(e.to_string()))?;
 
             // If we've caught up to the tip, we're done with historical sync
             if state.current_block >= current_tip {
@@ -122,93 +136,118 @@ impl Syncoor {
             let batch_start = state.current_block;
             let batch_end = min(batch_start + self.batch_size - 1, state.target_block);
 
-            // Create filter with block range
-            let mut batch_filter = self.filter.clone();
-            batch_filter = batch_filter.from_block(batch_start).to_block(batch_end);
-
-            match self.http_provider.get_logs(&batch_filter).await {
+            // Fetch and emit logs for the batch
+            match self.fetch_logs_range(batch_start, batch_end).await {
                 Ok(logs) => {
-                    // Send logs if any found
-                    if !logs.is_empty()
-                        && let Err(e) = self.sender.send(SyncMessage::Logs {
-                            logs: logs.into_iter().map(|log| log.inner).collect(),
-                            mode: SyncMode::Historical,
-                            block_range: (batch_start, batch_end),
-                        }) {
-                            return Err(anyhow!("Failed to send logs: {}", e));
-                        }
-
-                    // Send progress update
-                    let _ = self.sender.send(SyncMessage::Progress {
-                        current_block: batch_end,
-                        latest_block: current_tip,
-                        is_live: false,
-                    });
-
-                    // Update state
-                    state.current_block = batch_end + 1;
+                    self.emit_logs(logs, SyncMode::Historical, (batch_start, batch_end))?;
                 }
-                Err(e) => {
-                    let error_msg = format!(
-                        "Failed to get logs for blocks {}-{}: {}",
-                        batch_start, batch_end, e
-                    );
-                    let _ = self.sender.send(SyncMessage::Error(error_msg.clone()));
-                    return Err(anyhow!(error_msg));
+                Err(reason) => {
+                    let error = SyncoorError::HistoricalLogs {
+                        start: batch_start,
+                        end: batch_end,
+                        reason,
+                    };
+                    let _ = self.sender.send(SyncMessage::Error(error.clone()));
+                    return Err(error);
                 }
             }
+
+            // Send progress update
+            let _ = self.emit_progress(batch_end, current_tip, false);
+
+            // Update state
+            state.current_block = batch_end + 1;
         }
 
         Ok(())
     }
 
-    /// Long running live sync task that uses log subscription
+    /// Long running live sync task that subscribes to new blocks and fetches logs per block
     async fn live_sync(&self, mut state: SyncState) -> Result<()> {
-        // Subscribe to logs matching the filter
+        // Subscribe to new blocks
         let subscription = self
             .ws_provider
-            .subscribe_logs(&self.filter)
+            .subscribe_blocks()
             .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to subscribe to logs: {}. Make sure you're using a WebSocket provider.",
-                    e
-                )
-            })?;
+            .map_err(|e| SyncoorError::Subscribe(e.to_string()))?;
 
         let mut stream = subscription.into_stream();
 
-        // Process each log as it arrives
-        while let Some(log) = stream.next().await {
-            // Extract block number from the log
-            let block_number = log
-                .block_number
-                .ok_or_else(|| anyhow!("Received log without block number"))?;
+        // For each new block, fetch logs in that block using the HTTP provider
+        while let Some(header) = stream.next().await {
+            let block_number = header.number;
 
-            // Send the log
-            if let Err(e) = self.sender.send(SyncMessage::Logs {
-                logs: vec![log.inner],
-                mode: SyncMode::Live,
-                block_range: (block_number, block_number),
-            }) {
-                return Err(anyhow!("Failed to send live log: {}", e));
-            }
+            match self.fetch_logs_range(block_number, block_number).await {
+                Ok(logs) => {
+                    self.emit_logs(logs, SyncMode::Live, (block_number, block_number))?;
 
-            // Update state and send progress
-            if block_number >= state.current_block {
-                state.current_block = block_number + 1;
+                    // Update state and send progress
+                    if block_number >= state.current_block {
+                        state.current_block = block_number + 1;
 
-                if let Err(e) = self.sender.send(SyncMessage::Progress {
-                    current_block: block_number,
-                    latest_block: block_number,
-                    is_live: true,
-                }) {
-                    return Err(anyhow!("Failed to send progress: {}", e));
+                        let _ = self.emit_progress(block_number, block_number, true);
+                    }
+                }
+                Err(reason) => {
+                    let error = SyncoorError::LiveLogs {
+                        block: block_number,
+                        reason,
+                    };
+                    let _ = self.sender.send(SyncMessage::Error(error.clone()));
+                    return Err(error);
                 }
             }
         }
 
         // If we reach here, the stream has ended
-        Err(anyhow!("Log subscription stream ended unexpectedly"))
+        Err(SyncoorError::StreamEnded)
+    }
+
+    /// Build a filter for a specific block range
+    fn range_filter(&self, start: u64, end: u64) -> Filter {
+        self.filter.clone().from_block(start).to_block(end)
+    }
+
+    /// Fetch logs for a block range via the HTTP provider
+    async fn fetch_logs_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> std::result::Result<Vec<Log>, String> {
+        let filter = self.range_filter(start, end);
+        self.http_provider
+            .get_logs(&filter)
+            .await
+            .map(|logs| logs.into_iter().map(|log| log.inner).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Emit logs to the consumer
+    fn emit_logs(&self, logs: Vec<Log>, mode: SyncMode, block_range: (u64, u64)) -> Result<()> {
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        self.sender
+            .send(SyncMessage::Logs {
+                logs,
+                mode,
+                block_range,
+            })
+            .map_err(|e| match mode {
+                SyncMode::Historical => SyncoorError::SendLogs(e.to_string()),
+                SyncMode::Live => SyncoorError::SendLiveLog(e.to_string()),
+            })
+    }
+
+    /// Emit progress to the consumer
+    fn emit_progress(&self, current_block: u64, latest_block: u64, is_live: bool) -> Result<()> {
+        self.sender
+            .send(SyncMessage::Progress {
+                current_block,
+                latest_block,
+                is_live,
+            })
+            .map_err(|e| SyncoorError::SendProgress(e.to_string()))
     }
 }
