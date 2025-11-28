@@ -65,15 +65,12 @@ pub struct Syncoor {
 impl Syncoor {
     /// Start the sync process
     pub async fn start(&mut self) -> Result<()> {
-        println!("Getting latest block number...");
         // Get the latest block number
         let latest_block = self
             .http_provider
             .get_block_number()
             .await
             .map_err(|e| anyhow!("Failed to get latest block: {}", e))?;
-
-        println!("Latest block: {}", latest_block);
 
         let mut state = SyncState {
             current_block: self.from_block,
@@ -132,15 +129,14 @@ impl Syncoor {
             match self.http_provider.get_logs(&batch_filter).await {
                 Ok(logs) => {
                     // Send logs if any found
-                    if !logs.is_empty() {
-                        if let Err(e) = self.sender.send(SyncMessage::Logs {
+                    if !logs.is_empty()
+                        && let Err(e) = self.sender.send(SyncMessage::Logs {
                             logs: logs.into_iter().map(|log| log.inner).collect(),
                             mode: SyncMode::Historical,
                             block_range: (batch_start, batch_end),
                         }) {
                             return Err(anyhow!("Failed to send logs: {}", e));
                         }
-                    }
 
                     // Send progress update
                     let _ = self.sender.send(SyncMessage::Progress {
