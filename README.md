@@ -27,13 +27,7 @@ async fn main() -> Result<()> {
         .batch_size(5_000) // Optional: default is 1000
         .from_block(22_800_000) // Optional: default is 0
         .build();
-
-    // Start the sync process in the background
-    tokio::spawn(async move {
-        if let Err(e) = syncoor.start().await {
-            println!("Error: {e:?}");
-        }
-    });
+    syncoor.spawn().await?;
 
     // Receive all of the sync messages
     while let Some(msg) = receiver.recv().await {
