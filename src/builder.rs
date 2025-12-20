@@ -1,7 +1,6 @@
-use crate::{SyncMessage, Syncoor};
+use crate::{Result, SyncMessage, Syncoor, SyncoorError};
 use alloy_provider::{Provider, ProviderBuilder, WsConnect};
 use alloy_rpc_types::Filter;
-use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -57,7 +56,8 @@ impl SyncoorBuilder {
         let ws_connect = WsConnect::new(self.ws_url);
         let ws_provider = ProviderBuilder::new()
             .connect_ws(ws_connect)
-            .await?
+            .await
+            .map_err(SyncoorError::Provider)?
             .erased();
 
         let syncoor = Syncoor {

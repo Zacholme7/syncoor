@@ -1,14 +1,64 @@
 use alloy_primitives::Log;
-use alloy_provider::{DynProvider, Provider};
+use alloy_provider::{DynProvider, Provider, transport::TransportError};
 use alloy_rpc_types::Filter;
-use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use std::cmp::min;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
+use thiserror::Error;
+use tokio::sync::mpsc::{UnboundedSender, error::SendError};
 
 pub use builder::SyncoorBuilder;
 mod builder;
+
+/// Syncoor error types
+#[derive(Error, Debug)]
+pub enum SyncoorError {
+    #[error("Failed to get latest block")]
+    GetLatestBlock(#[source] TransportError),
+
+    #[error("Failed to get latest block during historical sync")]
+    GetLatestBlockHistorical(#[source] TransportError),
+
+    #[error("Failed to send mode transition")]
+    SendModeTransition(#[source] SendError<SyncMessage>),
+
+    #[error("Failed to send logs")]
+    SendLogs(#[source] SendError<SyncMessage>),
+
+    #[error("Failed to get logs for blocks {start}-{end}")]
+    GetLogs {
+        start: u64,
+        end: u64,
+        #[source]
+        source: TransportError,
+    },
+
+    #[error("Failed to subscribe to logs. Make sure you're using a WebSocket provider.")]
+    SubscribeLogs(#[source] TransportError),
+
+    #[error("Received log without block number")]
+    MissingBlockNumber,
+
+    #[error("Failed to send live log")]
+    SendLiveLog(#[source] SendError<SyncMessage>),
+
+    #[error("Failed to send progress")]
+    SendProgress(#[source] SendError<SyncMessage>),
+
+    #[error("Log subscription stream ended unexpectedly")]
+    StreamEnded,
+
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+
+    #[error(transparent)]
+    UrlParse(#[from] url::ParseError),
+
+    #[error("Provider error")]
+    Provider(#[source] TransportError),
+}
+
+pub type Result<T> = std::result::Result<T, SyncoorError>;
 
 /// Sync mode to distinguish between historical catchup and live tracking
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,7 +121,7 @@ impl Syncoor {
             .http_provider
             .get_block_number()
             .await
-            .map_err(|e| anyhow!("Failed to get latest block: {}", e))?;
+            .map_err(SyncoorError::GetLatestBlock)?;
 
         println!("Latest block: {}", latest_block);
 
@@ -90,7 +140,7 @@ impl Syncoor {
                 from: SyncMode::Historical,
                 to: SyncMode::Live,
             }) {
-                return Err(anyhow!("Failed to send mode transition: {}", e));
+                return Err(SyncoorError::SendModeTransition(e));
             }
         }
 
@@ -107,10 +157,11 @@ impl Syncoor {
     async fn historical_sync(&self, state: &mut SyncState) -> Result<()> {
         loop {
             // Check the current tip of the chain
-            let current_tip =
-                self.http_provider.get_block_number().await.map_err(|e| {
-                    anyhow!("Failed to get latest block during historical sync: {}", e)
-                })?;
+            let current_tip = self
+                .http_provider
+                .get_block_number()
+                .await
+                .map_err(SyncoorError::GetLatestBlockHistorical)?;
 
             // If we've caught up to the tip, we're done with historical sync
             if state.current_block >= current_tip {
@@ -138,7 +189,7 @@ impl Syncoor {
                             mode: SyncMode::Historical,
                             block_range: (batch_start, batch_end),
                         }) {
-                            return Err(anyhow!("Failed to send logs: {}", e));
+                            return Err(SyncoorError::SendLogs(e));
                         }
                     }
 
@@ -152,13 +203,14 @@ impl Syncoor {
                     // Update state
                     state.current_block = batch_end + 1;
                 }
-                Err(e) => {
-                    let error_msg = format!(
-                        "Failed to get logs for blocks {}-{}: {}",
-                        batch_start, batch_end, e
-                    );
-                    let _ = self.sender.send(SyncMessage::Error(error_msg.clone()));
-                    return Err(anyhow!(error_msg));
+                Err(source) => {
+                    let error = SyncoorError::GetLogs {
+                        start: batch_start,
+                        end: batch_end,
+                        source,
+                    };
+                    let _ = self.sender.send(SyncMessage::Error(error.to_string()));
+                    return Err(error);
                 }
             }
         }
@@ -173,12 +225,7 @@ impl Syncoor {
             .ws_provider
             .subscribe_logs(&self.filter)
             .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to subscribe to logs: {}. Make sure you're using a WebSocket provider.",
-                    e
-                )
-            })?;
+            .map_err(SyncoorError::SubscribeLogs)?;
 
         let mut stream = subscription.into_stream();
 
@@ -187,7 +234,7 @@ impl Syncoor {
             // Extract block number from the log
             let block_number = log
                 .block_number
-                .ok_or_else(|| anyhow!("Received log without block number"))?;
+                .ok_or_else(|| SyncoorError::MissingBlockNumber)?;
 
             // Send the log
             if let Err(e) = self.sender.send(SyncMessage::Logs {
@@ -195,7 +242,7 @@ impl Syncoor {
                 mode: SyncMode::Live,
                 block_range: (block_number, block_number),
             }) {
-                return Err(anyhow!("Failed to send live log: {}", e));
+                return Err(SyncoorError::SendLiveLog(e));
             }
 
             // Update state and send progress
@@ -207,12 +254,12 @@ impl Syncoor {
                     latest_block: block_number,
                     is_live: true,
                 }) {
-                    return Err(anyhow!("Failed to send progress: {}", e));
+                    return Err(SyncoorError::SendProgress(e));
                 }
             }
         }
 
         // If we reach here, the stream has ended
-        Err(anyhow!("Log subscription stream ended unexpectedly"))
+        Err(SyncoorError::StreamEnded)
     }
 }

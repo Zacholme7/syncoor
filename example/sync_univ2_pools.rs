@@ -1,8 +1,7 @@
 use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
-use anyhow::Result;
 use evm_abi::factories::UniswapV2Factory;
-use syncoor::{SyncMessage, SyncoorBuilder};
+use syncoor::{Result, SyncMessage, SyncoorBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
