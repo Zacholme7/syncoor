@@ -2,9 +2,12 @@ use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
 use evm_abi::factories::UniswapV2Factory;
 use syncoor::{Result, SyncMessage, SyncoorBuilder};
+use tracing::{Level, error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+
     // Configure URLs
     let http_url = "http://localhost:8545";
     let ws_url = "ws://localhost:8546";
@@ -13,18 +16,11 @@ async fn main() -> Result<()> {
     let filter = Filter::new().event_signature(UniswapV2Factory::PairCreated::SIGNATURE_HASH);
 
     // Build Syncoor with URLs and optional configuration
-    let (mut syncoor, mut receiver) = SyncoorBuilder::new(filter, http_url, ws_url)
+    let mut receiver = SyncoorBuilder::new(filter, http_url, ws_url)
         .batch_size(5_000) // Optional: default is 1000
-        .from_block(22_800_000) // Optional: default is 0
-        .build()
+        .from_block(24_000_000) // Optional: default is 0
+        .build_and_start()
         .await?;
-
-    // Start the sync process in the background
-    tokio::spawn(async move {
-        if let Err(e) = syncoor.start().await {
-            println!("Error: {e:?}");
-        }
-    });
 
     // Receive all of the sync messages
     while let Some(msg) = receiver.recv().await {
@@ -34,7 +30,7 @@ async fn main() -> Result<()> {
                 mode,
                 block_range,
             } => {
-                println!(
+                info!(
                     "Received {} logs from {:?} mode, blocks {:?}",
                     logs.len(),
                     mode,
@@ -42,20 +38,20 @@ async fn main() -> Result<()> {
                 );
             }
             SyncMessage::ModeTransition { from, to } => {
-                println!("Transitioned from {:?} to {:?}", from, to);
+                info!("Transitioned from {:?} to {:?}", from, to);
             }
             SyncMessage::Progress {
                 current_block,
                 latest_block,
                 is_live,
             } => {
-                println!(
+                info!(
                     "Progress: {}/{} (live: {})",
                     current_block, latest_block, is_live
                 );
             }
             SyncMessage::Error(e) => {
-                eprintln!("Sync error: {}", e);
+                error!("Sync error: {}", e);
             }
         }
     }

@@ -1,64 +1,16 @@
 use alloy_primitives::Log;
-use alloy_provider::{DynProvider, Provider, transport::TransportError};
+use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types::Filter;
 use futures_util::StreamExt;
 use std::cmp::min;
 use std::sync::Arc;
-use thiserror::Error;
-use tokio::sync::mpsc::{UnboundedSender, error::SendError};
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{error, info};
 
 pub use builder::SyncoorBuilder;
+pub use error::{Result, SyncoorError};
 mod builder;
-
-/// Syncoor error types
-#[derive(Error, Debug)]
-pub enum SyncoorError {
-    #[error("Failed to get latest block")]
-    GetLatestBlock(#[source] TransportError),
-
-    #[error("Failed to get latest block during historical sync")]
-    GetLatestBlockHistorical(#[source] TransportError),
-
-    #[error("Failed to send mode transition")]
-    SendModeTransition(#[source] SendError<SyncMessage>),
-
-    #[error("Failed to send logs")]
-    SendLogs(#[source] SendError<SyncMessage>),
-
-    #[error("Failed to get logs for blocks {start}-{end}")]
-    GetLogs {
-        start: u64,
-        end: u64,
-        #[source]
-        source: TransportError,
-    },
-
-    #[error("Failed to subscribe to logs. Make sure you're using a WebSocket provider.")]
-    SubscribeLogs(#[source] TransportError),
-
-    #[error("Received log without block number")]
-    MissingBlockNumber,
-
-    #[error("Failed to send live log")]
-    SendLiveLog(#[source] SendError<SyncMessage>),
-
-    #[error("Failed to send progress")]
-    SendProgress(#[source] SendError<SyncMessage>),
-
-    #[error("Log subscription stream ended unexpectedly")]
-    StreamEnded,
-
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
-
-    #[error(transparent)]
-    UrlParse(#[from] url::ParseError),
-
-    #[error("Provider error")]
-    Provider(#[source] TransportError),
-}
-
-pub type Result<T> = std::result::Result<T, SyncoorError>;
+mod error;
 
 /// Sync mode to distinguish between historical catchup and live tracking
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -113,9 +65,21 @@ pub struct Syncoor {
 }
 
 impl Syncoor {
-    /// Start the sync process
-    pub async fn start(&mut self) -> Result<()> {
-        println!("Getting latest block number...");
+    /// Start the sync process in the background. Consumes the coordinator and returns immediately
+    /// after the task is spawned.
+    pub async fn start(self) -> Result<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.run().await {
+                error!(error = ?e, "Sync loop exited with error");
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Full sync flow. Intended to run inside the background task.
+    async fn run(self) -> Result<()> {
+        info!("Getting latest block number...");
         // Get the latest block number
         let latest_block = self
             .http_provider
@@ -123,7 +87,7 @@ impl Syncoor {
             .await
             .map_err(SyncoorError::GetLatestBlock)?;
 
-        println!("Latest block: {}", latest_block);
+        info!(latest_block, "Fetched latest block");
 
         let mut state = SyncState {
             current_block: self.from_block,
@@ -183,14 +147,14 @@ impl Syncoor {
             match self.http_provider.get_logs(&batch_filter).await {
                 Ok(logs) => {
                     // Send logs if any found
-                    if !logs.is_empty() {
-                        if let Err(e) = self.sender.send(SyncMessage::Logs {
+                    if !logs.is_empty()
+                        && let Err(e) = self.sender.send(SyncMessage::Logs {
                             logs: logs.into_iter().map(|log| log.inner).collect(),
                             mode: SyncMode::Historical,
                             block_range: (batch_start, batch_end),
-                        }) {
-                            return Err(SyncoorError::SendLogs(e));
-                        }
+                        })
+                    {
+                        return Err(SyncoorError::SendLogs(e));
                     }
 
                     // Send progress update

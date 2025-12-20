@@ -1,7 +1,9 @@
 use crate::{Result, SyncMessage, Syncoor, SyncoorError};
 use alloy_provider::{Provider, ProviderBuilder, WsConnect};
 use alloy_rpc_types::Filter;
+use reqwest::ClientBuilder;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// Builder for Syncoor
@@ -42,10 +44,10 @@ impl SyncoorBuilder {
         let (sender, receiver) = unbounded_channel::<SyncMessage>();
 
         // Create HTTP provider with connection pooling
-        let http_client = reqwest::ClientBuilder::new()
+        let http_client = ClientBuilder::new()
             .pool_max_idle_per_host(10)
-            .pool_idle_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
             .build()?;
 
         let http_provider = ProviderBuilder::default()
@@ -70,5 +72,12 @@ impl SyncoorBuilder {
         };
 
         Ok((syncoor, receiver))
+    }
+
+    /// Build the Syncoor, start it in the background, and return the receiver.
+    pub async fn build_and_start(self) -> Result<UnboundedReceiver<SyncMessage>> {
+        let (syncoor, receiver) = self.build().await?;
+        syncoor.start().await?;
+        Ok(receiver)
     }
 }

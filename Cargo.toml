@@ -18,3 +18,5 @@ futures-util = "0.3.31"
 evm-abi = { git = "https://github.com/Zacholme7/evm-abi" }
 reqwest = "0.12.23"
 url = "2.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
