@@ -1,27 +1,29 @@
-use crate::{Result, SyncMessage, Syncoor, SyncoorError};
-use alloy_provider::{Provider, ProviderBuilder, WsConnect};
+use crate::{Result, SyncMessage, Syncoor};
+use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types::Filter;
-use reqwest::ClientBuilder;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// Builder for Syncoor
+#[derive(Clone)]
 pub struct SyncoorBuilder {
     filter: Filter,
-    http_url: String,
-    ws_url: String,
+    http_provider: Arc<DynProvider>,
+    ws_provider: Arc<DynProvider>,
     batch_size: Option<u64>,
     from_block: Option<u64>,
 }
 
 impl SyncoorBuilder {
-    /// Create a new SyncoorBuilder with HTTP and WebSocket URLs
-    pub fn new(filter: Filter, http_url: impl Into<String>, ws_url: impl Into<String>) -> Self {
+    /// Create a new SyncoorBuilder with HTTP and WebSocket providers.
+    pub fn new<P>(filter: Filter, http_provider: P, ws_provider: P) -> Self
+    where
+        P: Provider + 'static,
+    {
         Self {
             filter,
-            http_url: http_url.into(),
-            ws_url: ws_url.into(),
+            http_provider: Arc::new(http_provider.erased()),
+            ws_provider: Arc::new(ws_provider.erased()),
             batch_size: None,
             from_block: None,
         }
@@ -43,30 +45,11 @@ impl SyncoorBuilder {
     pub async fn build(self) -> Result<(Syncoor, UnboundedReceiver<SyncMessage>)> {
         let (sender, receiver) = unbounded_channel::<SyncMessage>();
 
-        // Create HTTP provider with connection pooling
-        let http_client = ClientBuilder::new()
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(30))
-            .build()?;
-
-        let http_provider = ProviderBuilder::default()
-            .connect_reqwest(http_client, self.http_url.parse()?)
-            .erased();
-
-        // Create WebSocket provider
-        let ws_connect = WsConnect::new(self.ws_url);
-        let ws_provider = ProviderBuilder::new()
-            .connect_ws(ws_connect)
-            .await
-            .map_err(SyncoorError::Provider)?
-            .erased();
-
         let syncoor = Syncoor {
             sender,
             filter: self.filter,
-            http_provider: Arc::new(http_provider),
-            ws_provider: Arc::new(ws_provider),
+            http_provider: self.http_provider,
+            ws_provider: self.ws_provider,
             batch_size: self.batch_size.unwrap_or(1000),
             from_block: self.from_block.unwrap_or(0),
         };

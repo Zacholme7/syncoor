@@ -1,7 +1,8 @@
+use alloy_provider::{Provider, ProviderBuilder, WsConnect};
 use alloy_rpc_types::Filter;
 use alloy_sol_types::SolEvent;
 use evm_abi::factories::UniswapV2Factory;
-use syncoor::{Result, SyncMessage, SyncoorBuilder};
+use syncoor::{Result, SyncMessage, SyncoorBuilder, SyncoorError};
 use tracing::{Level, error, info};
 
 #[tokio::main]
@@ -15,8 +16,20 @@ async fn main() -> Result<()> {
     // Construct your desired filter. Match against addresses, events, etc...
     let filter = Filter::new().event_signature(UniswapV2Factory::PairCreated::SIGNATURE_HASH);
 
-    // Build Syncoor with URLs and optional configuration
-    let mut receiver = SyncoorBuilder::new(filter, http_url, ws_url)
+    // Build providers
+    let http_provider = ProviderBuilder::new()
+        .connect_http(http_url.parse()?)
+        .erased();
+
+    let ws_connect = WsConnect::new(ws_url);
+    let ws_provider = ProviderBuilder::new()
+        .connect_ws(ws_connect)
+        .await
+        .map_err(SyncoorError::Provider)?
+        .erased();
+
+    // Build Syncoor with providers and optional configuration
+    let mut receiver = SyncoorBuilder::new(filter, http_provider, ws_provider)
         .batch_size(5_000) // Optional: default is 1000
         .from_block(24_000_000) // Optional: default is 0
         .build_and_start()
