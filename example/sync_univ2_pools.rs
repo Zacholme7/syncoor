@@ -31,7 +31,8 @@ async fn main() -> Result<()> {
     // Build Syncoor with providers and optional configuration
     let mut receiver = SyncoorBuilder::new(filter, http_provider, ws_provider)
         .batch_size(5_000) // Optional: default is 1000
-        .from_block(24_000_000) // Optional: default is 0
+        .from_block(23_000_000) // Optional: default is 0
+        .preserve_block_order(false) 
         .build_and_start()
         .await?;
 

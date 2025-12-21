@@ -12,6 +12,9 @@ pub struct SyncoorBuilder {
     ws_provider: Arc<DynProvider>,
     batch_size: Option<u64>,
     from_block: Option<u64>,
+    max_retries: Option<u32>,
+    concurrent_batches: Option<usize>,
+    preserve_block_order: Option<bool>,
 }
 
 impl SyncoorBuilder {
@@ -26,6 +29,9 @@ impl SyncoorBuilder {
             ws_provider: Arc::new(ws_provider.erased()),
             batch_size: None,
             from_block: None,
+            max_retries: None,
+            concurrent_batches: None,
+            preserve_block_order: None,
         }
     }
 
@@ -41,6 +47,24 @@ impl SyncoorBuilder {
         self
     }
 
+    /// Set the max retries for a failed historical sync batch (default: 3)
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = Some(retries);
+        self
+    }
+
+    /// Set the number of concurrent historical batch requests (default: 4)
+    pub fn concurrent_batches(mut self, count: usize) -> Self {
+        self.concurrent_batches = Some(count);
+        self
+    }
+
+    /// Preserve block order when processing historical batches (default: true)
+    pub fn preserve_block_order(mut self, preserve: bool) -> Self {
+        self.preserve_block_order = Some(preserve);
+        self
+    }
+
     /// Build the Syncoor with properly configured providers
     pub async fn build(self) -> Result<(Syncoor, UnboundedReceiver<SyncMessage>)> {
         let (sender, receiver) = unbounded_channel::<SyncMessage>();
@@ -52,6 +76,9 @@ impl SyncoorBuilder {
             ws_provider: self.ws_provider,
             batch_size: self.batch_size.unwrap_or(1000),
             from_block: self.from_block.unwrap_or(0),
+            max_retries: self.max_retries.unwrap_or(3),
+            concurrent_batches: self.concurrent_batches.unwrap_or(4).max(1),
+            preserve_block_order: self.preserve_block_order.unwrap_or(true),
         };
 
         Ok((syncoor, receiver))

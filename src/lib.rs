@@ -1,6 +1,7 @@
 use alloy_primitives::Log;
 use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types::Filter;
+use futures_util::stream::{self, BoxStream};
 use futures_util::StreamExt;
 use std::cmp::min;
 use std::sync::Arc;
@@ -62,6 +63,12 @@ pub struct Syncoor {
     batch_size: u64,
     /// Starting block for historical sync (None means start from genesis)
     from_block: u64,
+    /// Max retries for failed historical sync batches
+    max_retries: u32,
+    /// Max number of concurrent historical batch requests
+    concurrent_batches: usize,
+    /// Preserve block order when processing historical batches
+    preserve_block_order: bool,
 }
 
 impl Syncoor {
@@ -136,50 +143,81 @@ impl Syncoor {
             // Update target to current tip
             state.target_block = current_tip;
 
-            // Process a batch
-            let batch_start = state.current_block;
-            let batch_end = min(batch_start + self.batch_size - 1, state.target_block);
+            // Build batch ranges for the current window
+            let mut ranges = Vec::new();
+            let mut batch_start = state.current_block;
+            while batch_start <= state.target_block {
+                let batch_end = min(batch_start + self.batch_size - 1, state.target_block);
+                ranges.push((batch_start, batch_end));
+                batch_start = batch_end + 1;
+            }
 
-            // Create filter with block range
-            let mut batch_filter = self.filter.clone();
-            batch_filter = batch_filter.from_block(batch_start).to_block(batch_end);
+            let fetches = stream::iter(ranges).map(|(start, end)| async move {
+                let logs = self.fetch_batch_logs(start, end).await?;
+                Ok((start, end, logs))
+            });
 
-            match self.http_provider.get_logs(&batch_filter).await {
-                Ok(logs) => {
-                    // Send logs if any found
-                    if !logs.is_empty()
-                        && let Err(e) = self.sender.send(SyncMessage::Logs {
-                            logs: logs.into_iter().map(|log| log.inner).collect(),
-                            mode: SyncMode::Historical,
-                            block_range: (batch_start, batch_end),
-                        })
-                    {
-                        return Err(SyncoorError::SendLogs(e));
+            let mut fetches: BoxStream<'_, Result<(u64, u64, Vec<Log>)>> =
+                if self.preserve_block_order {
+                    fetches.buffered(self.concurrent_batches).boxed()
+                } else {
+                    fetches.buffer_unordered(self.concurrent_batches).boxed()
+                };
+
+            while let Some(result) = fetches.next().await {
+                match result {
+                    Ok((batch_start, batch_end, logs)) => {
+                        // Send logs if any found
+                        if !logs.is_empty()
+                            && let Err(e) = self.sender.send(SyncMessage::Logs {
+                                logs,
+                                mode: SyncMode::Historical,
+                                block_range: (batch_start, batch_end),
+                            })
+                        {
+                            return Err(SyncoorError::SendLogs(e));
+                        }
+
+                        // Send progress update
+                        let _ = self.sender.send(SyncMessage::Progress {
+                            current_block: batch_end,
+                            latest_block: current_tip,
+                            is_live: false,
+                        });
                     }
-
-                    // Send progress update
-                    let _ = self.sender.send(SyncMessage::Progress {
-                        current_block: batch_end,
-                        latest_block: current_tip,
-                        is_live: false,
-                    });
-
-                    // Update state
-                    state.current_block = batch_end + 1;
-                }
-                Err(source) => {
-                    let error = SyncoorError::GetLogs {
-                        start: batch_start,
-                        end: batch_end,
-                        source,
-                    };
-                    let _ = self.sender.send(SyncMessage::Error(error.to_string()));
-                    return Err(error);
+                    Err(error) => {
+                        let _ = self.sender.send(SyncMessage::Error(error.to_string()));
+                        return Err(error);
+                    }
                 }
             }
+
+            // All batches in the current window completed
+            state.current_block = state.target_block + 1;
         }
 
         Ok(())
+    }
+
+    async fn fetch_batch_logs(&self, start: u64, end: u64) -> Result<Vec<Log>> {
+        let mut batch_filter = self.filter.clone();
+        batch_filter = batch_filter.from_block(start).to_block(end);
+
+        let mut attempt = 0;
+        loop {
+            match self.http_provider.get_logs(&batch_filter).await {
+                Ok(logs) => {
+                    let logs = logs.into_iter().map(|log| log.inner).collect();
+                    return Ok(logs);
+                }
+                Err(source) => {
+                    attempt += 1;
+                    if attempt >= self.max_retries {
+                        return Err(SyncoorError::GetLogs { start, end, source });
+                    }
+                }
+            }
+        }
     }
 
     /// Long running live sync task that uses log subscription
