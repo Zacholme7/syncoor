@@ -20,7 +20,7 @@ pub enum SyncoorError {
     #[error("Failed to send logs")]
     SendLogs(#[source] SendError<SyncMessage>),
 
-    #[error("Failed to get logs for blocks {start}-{end}")]
+    #[error("Failed to get logs for blocks {start}-{end}: {source}")]
     GetLogs {
         start: u64,
         end: u64,
